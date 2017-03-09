@@ -1,0 +1,249 @@
+---
+title: "Milestone Report on Building a Predictive Text Model"
+author: "phyhouhou"
+date: "2/16/2017"
+output: 
+  html_document:
+    keep_md: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F,message = F,warning = F,cache=T)
+#set options
+options(stringAsFactors=F)
+```
+
+##Overview
+This report serves as a milestone report for the predictive text model for the capstone project in the data science specialization courses. The complete original capstone data is downloaded from the [link](https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip). It contains four folders in English, German, Russian and Finnish. This project will use the English database. An exploratory analysis after downloading, summarizing and sampling the raw data is performed. A brief description of plans for creating the prediction algorithm and Shiny App is also provided.
+
+##Download and explore data
+We first download and unzip the raw data. We use the English text files included in the folder 'en_US', namely, '`r substr(list.files('./data',pattern='en_US',recursive = T), 13,100)[1]`', '`r substr(list.files('./data',pattern='en_US',recursive = T), 13,100)[2]`', and '`r substr(list.files('./data',pattern='en_US',recursive = T), 13,100)[3]`' as our working database. Then we read the text files into R with the readLines( ) function, which reads each line as a separate character vector. The size of each text file (in megabyte (MB)) and the number of lines, the number of words, the number of numbers are summarized in the table below:
+
+```{r,results='hide'}
+#setwd("~/couresera in R/capstone project")
+
+#install and load required packages
+libs<-c('magrittr','knitr','qdap','tm','slam','ggplot2','wordcloud','RWeka')
+#install.packages(libs)
+lapply(libs,require,character.only=T)
+
+#download and unzip data
+url<-'https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip'
+if(!file.exists("data")){dir.create("data")}
+download.file(url,destfile = 'data/Coursera-SwiftKey.zip', method='curl')
+unzip('data/Coursera-SwiftKey.zip',exdir='data')
+```
+
+```{r}
+#list the English files
+fls<-paste('./data/',list.files('./data',pattern='en_US',recursive = T),sep='') %>% as.list()# '%>%' require(magrittr)
+
+#size of each file in megabyte(MB)
+size<-sapply(fls,function(x){file.info(x)$size/2**20})#or file.size(x) to replace file.info(x)$size
+
+#read in the textfiles
+texts<-sapply(fls, function(x){readLines(x,encoding = "UTF-8", skipNul = T)} )
+names(texts)<-c('blogs_txt','news_txt','twitter_txt')
+
+#number of lines in each textfile (note the lines meaning sep="\n")
+lines<-sapply(texts,length)
+
+#number of words in each textfile
+counter_w<-function(x){sum(sapply(gregexpr("\\S+", x), length))}
+words<- sapply(texts,counter_w)
+
+#number of numbers in each file
+wordsNonum<-sapply(texts,function(x){gsub('\\d','',x) %>% counter_w()})#delete numbers
+nums<-words-wordsNonum
+
+#data summary in a data frame
+df<- data.frame(
+Size_MB=size,#size of each file in megabytes
+Lines=lines,#number of lines in each file
+Words=words,#number of words in each file
+Nums =nums,#number of numbers in each file
+row.names = c('Blog','News','Twitter')
+)
+require(knitr)
+kable(df,align='c',caption='A summary of text files')
+```
+
+The table above shows that the dataset is fairly large. We need to sample a smaller subset of the data. An estimate of 'Words/Lines' indicates that blog files tend to use long stentences while twitter files tend to use short sentences. An estimate of 'Nums/Words' reveals that the News data tend to use more numbers than blog or twitter data.
+
+Based on the summary, we will use a smaller subset of the data and create a separate sample dataset. We choose to randomly select 1% samples from each text file and combine them as a whole.
+```{r}
+percent<-0.01
+
+set.seed(1357)
+index<-sapply(texts, function(x){sample(1:length(x),round(percent*length(x)))})
+blog_s<-texts$blogs_txt[index$blogs_txt]
+news_s<-texts$news_txt[index$news_txt]
+twitter_s<-texts$twitter_txt[index$twitter_txt]
+text_s<-c(blog_s,news_s,twitter_s)
+
+set.seed(1357)
+text_s<-sample(text_s,length(text_s))#to mix texts randomly 
+```
+
+```{r,results='hide'}
+remove(texts)#no longer needed, release RAM
+gc()#garbage collector to retrieve unused RAM for R. It tells you how much memory is currently being used by R.
+```
+
+##Exploratory analysis 
+
+We will perform an exploratory analysis on the sample data in this section. First we will create a corpus and make it tidy. Data cleaning includes the following processes: eliminating emojis, urls, replacing common contractions and abbreviations with their long forms, converting words to its lower case and removing [bad words]('http://www.bannedwordlist.com/lists/swearWords.txt') and stopwords in English (for the purpose of this milestone report), replacing punctuations with space (to avoid some combined strange words), removing numbers and white spaces. We will also remove single letters generated due to removing punctuations, i.e., 's', 'd' et al. We will make functions to perform the specific tasks below.
+
+```{r}
+#eliminate emojis or invalid characters
+removeEmos<-function(x) {iconv(x, 'latin1', 'ASCII', sub='')}#sub is used to replace any non-convertible bytes in the input
+
+#contraction symbol "'"
+contractSym<-function(x){gsub("’","'",x)}
+
+#remove special patterns
+removePattern<-function(x,pattern){gsub(pattern,'',x)}
+
+#repalce punctuations by space 
+PunctoSpace<-function (x){x<-gsub('[[:punct:]]+', ' ', x)}
+
+#remove 's','t','d' created from contracted words
+removeSingleLetter<-function(x){x<-gsub(' s | t | d | g ','',x )}
+
+#abbreviations
+abb_ls<-data.frame(abv=c('A.M.','P.M.'),rep=c('AM','PM'))
+
+#contractions
+contrct_ls<-contractions %>% rbind(data.frame(contraction=c("Here's","Haven't","Hadn't"),expanded=c("Here is","Have not", "Had not")))
+
+#import bad words
+badwords<-readLines("http://www.bannedwordlist.com/lists/swearWords.txt",encoding = "UTF-8", skipNul = T)  
+
+#clean the sampled texts
+fun_clean<-function(x){
+    removeEmos(x) %>% #remove emojis 
+    removePattern(pattern='http\\S*\\s*|www\\S*\\s*')%>%#remove urls
+    replace_abbreviation(abbreviation = abb_ls,ignore.case=T) %>%                       #require(qdap) it replaces abbs with long form.
+    contractSym() %>% #take ' as contraction symbol
+    tolower()%>%#change to lower case
+    removeWords(badwords)%>%
+    removeWords(stopwords('en'))%>%
+    replace_contraction(contraction=contrct_ls,ignore.case=T)%>%#rm contractins 
+    PunctoSpace()%>%#replace punctuationsto space
+    removeNumbers()%>%#remove numbers
+    removeSingleLetter()%>%#remove nonwords single letters 
+    removePattern(pattern = '^\\s+|\\s+$') %>% #trim leading and trailling whitespaces)
+    stripWhitespace()#remove extra white spaces
+}
+        
+#create a corpus and make it a plain text document
+mycorpus<-Corpus(VectorSource(text_s))%>% #require(tm)
+        tm_map(content_transformer(fun_clean)) %>% 
+        tm_map(PlainTextDocument)#convert to plain text doc
+```
+
+After these cleaning procedures, we will explore different sets of n-grams (a contiguous sequence of n items from a given sequence of text or speech, from [wiki](https://en.wikipedia.org/wiki/N-gram)). We will build a 2-column data frame ordered by words' frequencies.  
+
+```{r}
+#construct the term-document matrix and remove sparse terms
+unigram<-TermDocumentMatrix(mycorpus) #%>% removeSparseTerms(sparse=0.99)
+#inspect(unigram[10:20,1])# the tdm is very spare
+
+#define a function to make a 2-column data frame for tdm
+fun_freq<-function(x){
+   word_freq<-rollup(x, 2, na.rm=TRUE, FUN = sum)%>%as.matrix() %>%               rowSums() %>% sort(decreasing=T)#require(slam)
+   df_wf<-data.frame(word=names(word_freq),count=word_freq,row.names=NULL)#create a data frame by words and their frequencies
+   df_wf
+}
+```
+
+As an example, we illustrate the frequency of the top 10 most frequent words in a barplot.
+
+```{r}
+#the top 10 most frequent words
+unigram<-fun_freq(unigram)
+top10<-unigram[1:10,]
+
+#make a barplot
+p<-ggplot(top10, aes(x=reorder(word,-count), y= count))
+p+geom_bar(stat='identity',fill='steelblue',size=1,color='black')+
+        labs(x='', y="Counts of words")+
+          ggtitle('Top 10 Most Frequent Unigrams')+ 
+            geom_text(aes(label=count), vjust=-0.3)+ 
+              theme(axis.text.x=element_text(angle=0,hjust=1,color='black',size=rel(1.2)))#+coord_flip()
+```
+
+We also create a word cloud to qualitatively show the distributions of words in the text file.
+
+```{r}
+#plot word cloud
+set.seed(123)
+wordcloud(words=unigram$word,freq=unigram$count, random.color=F, random.order=F,rot.per=0.2,color=brewer.pal(12, "Set3"), min.freq=1, max.words=100, scale=c(3, 0.3))
+```
+
+```{r,results='hide'}
+rm(unigram)
+gc()
+```
+
+##Make bigrams
+We first define a n-gram generator and then build bigrams and make a barplot to show the top 10 most frequent bigrams and build a wordcloud for a more qualitative view.
+
+```{r}
+#define a function to generate n-gram
+fun_ngram <- function(x,n){
+options(java.parameters = "-Xmx8g")
+options(mc.cores=1)
+ngramTokenizer <- function(y) {NGramTokenizer(y, Weka_control(min = n, max = n)) }
+tdm_n<-TermDocumentMatrix(x, control = list(tokenize = ngramTokenizer)) 
+tdm_n
+}
+#generate bigrams and select the top 10 most frequent terms
+bigram<-fun_ngram(mycorpus,2) %>% fun_freq()
+top10_bi<-bigram[1:10,]
+#make a barplot
+p2<-ggplot(top10_bi, aes(x=reorder(word,count), y= count))
+p2+geom_bar(stat='identity',fill='steelblue',size=1,color='black')+
+        labs(x='', y="Counts of bigrams")+
+          ggtitle('Top 10 Most Frequent Bigrams')+ 
+            geom_text(aes(label=count), hjust=-0.1)+ 
+              theme(axis.text.y=element_text(angle=0,hjust=1,color='black',size=rel(1.2)))+coord_flip()
+
+#make a wordcloud
+set.seed(123)
+wordcloud(words=bigram$word,freq=bigram$count, random.color=F, random.order=F,color=brewer.pal(12, "Set3"), min.freq=1, max.words=50, scale=c(3, 0.3))
+```
+
+```{r,results='hide'}
+rm(bigram)
+gc()
+```
+
+##Make trigrams
+
+In analogy to unigrams and bigrams, we make trigrams and visulize them in a barplot and wordcloud.
+```{r}
+#generate trigrams and select the top 10 most frequent terms
+trigram<-fun_ngram(mycorpus,3) %>% fun_freq()
+top10_tri<-trigram[1:10,]
+#make a barplot
+p3<-ggplot(top10_tri, aes(x=reorder(word,count), y= count))
+p3+geom_bar(stat='identity',fill='steelblue',size=1,color='black')+
+        labs(x='', y="Counts of trigrams")+
+          ggtitle('Top 10 Most Frequent Trigrams')+ 
+            geom_text(aes(label=count), hjust=-0.1)+ 
+              theme(axis.text.y=element_text(angle=0,hjust=1,color='black',size=rel(1.2)))+coord_flip()
+#make wordcloud
+set.seed(123)
+wordcloud(words=trigram$word,freq=trigram$count, random.color=F, random.order=F,rot.per=0.5,color=brewer.pal(12, "Set3"), min.freq=1, max.words=50, scale=c(3, 0.3))
+```
+
+```{r,results='hide'}
+rm(trigram)
+gc()
+```
+
+##Goals for the eventual app and algorithm
+
+We have performed an exploratory analysis of the text files in previous section. As the next step, we need to think better way of cleaning the corpus. After that we will build a table of unique ngrams by frequencies. The next word will be predicted based on the previous 1, 2, or 3 words. In case of unseen ngrams that do not appear in the corpora we will use the backoff algorithm. We need to evaluate precision of our prediction model and we also need to consider the code's efficiency to make it a user-friendly shiny app.
+
